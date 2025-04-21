@@ -21,10 +21,12 @@ func mergeBlockStreams(ph *partHeader, bsw *blockStreamWriter, bsrs []*blockStre
 
 	bsm := bsmPool.Get().(*blockStreamMerger)
 	bsm.Init(bsrs, retentionDeadline, useSparseCache)
-	err := mergeBlockStreamsInternal(ph, bsw, bsm, stopCh, dmis, rowsMerged, rowsDeleted)
+	rowsMergedLocal, rowsDeletedLocal, err := mergeBlockStreamsInternal(ph, bsw, bsm, stopCh, dmis)
 	bsm.reset()
 	bsmPool.Put(bsm)
 	bsw.MustClose()
+	rowsMerged.Add(uint64(rowsMergedLocal))
+	rowsDeleted.Add(uint64(rowsDeletedLocal))
 	if err == nil {
 		return nil
 	}
@@ -39,7 +41,8 @@ var bsmPool = &sync.Pool{
 
 var errForciblyStopped = fmt.Errorf("forcibly stopped")
 
-func mergeBlockStreamsInternal(ph *partHeader, bsw *blockStreamWriter, bsm *blockStreamMerger, stopCh <-chan struct{}, dmis *uint64set.Set, rowsMerged, rowsDeleted *atomic.Uint64) error {
+func mergeBlockStreamsInternal(ph *partHeader, bsw *blockStreamWriter, bsm *blockStreamMerger, stopCh <-chan struct{}, dmis *uint64set.Set) (int, int, error) {
+	rowsMerged, rowsDeleted := 0, 0
 	pendingBlockIsEmpty := true
 	pendingBlock := getBlock()
 	defer putBlock(pendingBlock)
@@ -48,19 +51,19 @@ func mergeBlockStreamsInternal(ph *partHeader, bsw *blockStreamWriter, bsm *bloc
 	for bsm.NextBlock() {
 		select {
 		case <-stopCh:
-			return errForciblyStopped
+			return rowsMerged, rowsDeleted, errForciblyStopped
 		default:
 		}
 		b := bsm.Block
 		if dmis.Has(b.bh.TSID.MetricID) {
 			// Skip blocks for deleted metrics.
-			rowsDeleted.Add(uint64(b.bh.RowsCount))
+			rowsDeleted += int(b.bh.RowsCount)
 			continue
 		}
 		retentionDeadline := bsm.getRetentionDeadline(&b.bh)
 		if b.bh.MaxTimestamp < retentionDeadline {
 			// Skip blocks out of the given retention.
-			rowsDeleted.Add(uint64(b.bh.RowsCount))
+			rowsDeleted += int(b.bh.RowsCount)
 			continue
 		}
 		if pendingBlockIsEmpty {
@@ -77,14 +80,14 @@ func mergeBlockStreamsInternal(ph *partHeader, bsw *blockStreamWriter, bsm *bloc
 			if b.bh.TSID.Less(&pendingBlock.bh.TSID) {
 				logger.Panicf("BUG: the next TSID=%+v is smaller than the current TSID=%+v", &b.bh.TSID, &pendingBlock.bh.TSID)
 			}
-			bsw.WriteExternalBlock(pendingBlock, ph, rowsMerged)
+			rowsMerged += bsw.WriteExternalBlock(pendingBlock, ph)
 			pendingBlock.CopyFrom(b)
 			continue
 		}
 		if pendingBlock.tooBig() && pendingBlock.bh.MaxTimestamp <= b.bh.MinTimestamp {
 			// Fast path - pendingBlock is too big and it doesn't overlap with b.
 			// Write the pendingBlock and then deal with b.
-			bsw.WriteExternalBlock(pendingBlock, ph, rowsMerged)
+			rowsMerged += bsw.WriteExternalBlock(pendingBlock, ph)
 			pendingBlock.CopyFrom(b)
 			continue
 		}
@@ -92,13 +95,13 @@ func mergeBlockStreamsInternal(ph *partHeader, bsw *blockStreamWriter, bsm *bloc
 		// Slow path - pendingBlock and b belong to the same time series,
 		// so they must be merged.
 		if err := unmarshalAndCalibrateScale(pendingBlock, b); err != nil {
-			return fmt.Errorf("cannot unmarshal and calibrate scale for blocks to be merged: %w", err)
+			return rowsMerged, rowsDeleted, fmt.Errorf("cannot unmarshal and calibrate scale for blocks to be merged: %w", err)
 		}
 		tmpBlock.Reset()
 		tmpBlock.bh.TSID = b.bh.TSID
 		tmpBlock.bh.Scale = b.bh.Scale
 		tmpBlock.bh.PrecisionBits = minUint8(pendingBlock.bh.PrecisionBits, b.bh.PrecisionBits)
-		mergeBlocks(tmpBlock, pendingBlock, b, retentionDeadline, rowsDeleted)
+		rowsDeleted += mergeBlocks(tmpBlock, pendingBlock, b, retentionDeadline)
 		if len(tmpBlock.timestamps) <= maxRowsPerBlock {
 			// More entries may be added to tmpBlock. Swap it with pendingBlock,
 			// so more entries may be added to pendingBlock on the next iteration.
@@ -120,45 +123,45 @@ func mergeBlockStreamsInternal(ph *partHeader, bsw *blockStreamWriter, bsm *bloc
 		tmpBlock.timestamps = tmpBlock.timestamps[:maxRowsPerBlock]
 		tmpBlock.values = tmpBlock.values[:maxRowsPerBlock]
 		tmpBlock.fixupTimestamps()
-		bsw.WriteExternalBlock(tmpBlock, ph, rowsMerged)
+		rowsMerged += bsw.WriteExternalBlock(tmpBlock, ph)
 	}
 	if err := bsm.Error(); err != nil {
-		return fmt.Errorf("cannot read block to be merged: %w", err)
+		return rowsMerged, rowsDeleted, fmt.Errorf("cannot read block to be merged: %w", err)
 	}
 	if !pendingBlockIsEmpty {
-		bsw.WriteExternalBlock(pendingBlock, ph, rowsMerged)
+		rowsMerged += bsw.WriteExternalBlock(pendingBlock, ph)
 	}
-	return nil
+	return rowsMerged, rowsDeleted, nil
 }
 
 // mergeBlocks merges ib1 and ib2 to ob.
-func mergeBlocks(ob, ib1, ib2 *Block, retentionDeadline int64, rowsDeleted *atomic.Uint64) {
+func mergeBlocks(ob, ib1, ib2 *Block, retentionDeadline int64) int {
 	ib1.assertMergeable(ib2)
 	ib1.assertUnmarshaled()
 	ib2.assertUnmarshaled()
 
-	skipSamplesOutsideRetention(ib1, retentionDeadline, rowsDeleted)
-	skipSamplesOutsideRetention(ib2, retentionDeadline, rowsDeleted)
+	rowsDeleted := skipSamplesOutsideRetention(ib1, retentionDeadline)
+	rowsDeleted += skipSamplesOutsideRetention(ib2, retentionDeadline)
 
 	if ib1.bh.MaxTimestamp < ib2.bh.MinTimestamp {
 		// Fast path - ib1 values have smaller timestamps than ib2 values.
 		appendRows(ob, ib1)
 		appendRows(ob, ib2)
-		return
+		return rowsDeleted
 	}
 	if ib2.bh.MaxTimestamp < ib1.bh.MinTimestamp {
 		// Fast path - ib2 values have smaller timestamps than ib1 values.
 		appendRows(ob, ib2)
 		appendRows(ob, ib1)
-		return
+		return rowsDeleted
 	}
 	if ib1.nextIdx >= len(ib1.timestamps) {
 		appendRows(ob, ib2)
-		return
+		return rowsDeleted
 	}
 	if ib2.nextIdx >= len(ib2.timestamps) {
 		appendRows(ob, ib1)
-		return
+		return rowsDeleted
 	}
 	for {
 		i := ib1.nextIdx
@@ -171,16 +174,16 @@ func mergeBlocks(ob, ib1, ib2 *Block, retentionDeadline int64, rowsDeleted *atom
 		ib1.nextIdx = i
 		if ib1.nextIdx >= len(ib1.timestamps) {
 			appendRows(ob, ib2)
-			return
+			return rowsDeleted
 		}
 		ib1, ib2 = ib2, ib1
 	}
 }
 
-func skipSamplesOutsideRetention(b *Block, retentionDeadline int64, rowsDeleted *atomic.Uint64) {
+func skipSamplesOutsideRetention(b *Block, retentionDeadline int64) int {
 	if b.bh.MinTimestamp >= retentionDeadline {
 		// Fast path - the block contains only samples with timestamps bigger than retentionDeadline.
-		return
+		return 0
 	}
 	timestamps := b.timestamps
 	nextIdx := b.nextIdx
@@ -188,10 +191,12 @@ func skipSamplesOutsideRetention(b *Block, retentionDeadline int64, rowsDeleted 
 	for nextIdx < len(timestamps) && timestamps[nextIdx] < retentionDeadline {
 		nextIdx++
 	}
+	rowsDeleted := 0
 	if n := nextIdx - nextIdxOrig; n > 0 {
-		rowsDeleted.Add(uint64(n))
+		rowsDeleted += n
 		b.nextIdx = nextIdx
 	}
+	return rowsDeleted
 }
 
 func appendRows(ob, ib *Block) {

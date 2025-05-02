@@ -57,6 +57,7 @@ require (
 	github.com/influxdata/influxdb v1.12.0
 	github.com/klauspost/compress v1.18.0
 	github.com/mattn/go-isatty v0.0.20
+	github.com/prometheus/procfs v0.16.1
 	github.com/prometheus/prometheus v0.303.0
 	github.com/urfave/cli/v2 v2.27.6
 	github.com/valyala/fastjson v1.6.4
@@ -138,7 +139,6 @@ require (
 	github.com/prometheus/client_golang v1.22.0 // indirect
 	github.com/prometheus/client_model v0.6.2 // indirect
 	github.com/prometheus/common v0.63.0 // indirect
-	github.com/prometheus/procfs v0.16.1 // indirect
 	github.com/prometheus/sigv4 v0.1.2 // indirect
 	github.com/puzpuzpuz/xsync/v3 v3.5.1 // indirect
 	github.com/rivo/uniseg v0.4.7 // indirect

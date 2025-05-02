@@ -5,11 +5,10 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/VictoriaMetrics/metrics"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/auth"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
@@ -37,7 +36,9 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/puppetdb"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/vultr"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/yandexcloud"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/nodeexporter"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promutil"
+	"github.com/VictoriaMetrics/metrics"
 )
 
 var (
@@ -48,6 +49,7 @@ var (
 	promscrapeConfigFile = flag.String("promscrape.config", "", "Optional path to Prometheus config file with 'scrape_configs' section containing targets to scrape. "+
 		"The path can point to local file and to http url. "+
 		"See https://docs.victoriametrics.com/victoriametrics/single-server-victoriametrics/#how-to-scrape-prometheus-exporters-such-as-node-exporter for details")
+	promscrapeKubernetes = flag.Bool("promscrape.kubernetes", false, "Enable scrape of common Kubernetes metrics")
 
 	fileSDCheckInterval = flag.Duration("promscrape.fileSDCheckInterval", time.Minute, "Interval for checking for changes in 'file_sd_config'. "+
 		"See https://docs.victoriametrics.com/victoriametrics/sd_configs/#file_sd_configs for details")
@@ -152,6 +154,11 @@ func runScraper(configFile string, pushData func(at *auth.Token, wr *prompbmarsh
 	scs.add("yandexcloud_sd_configs", *yandexcloud.SDCheckInterval, func(cfg *Config, swsPrev []*ScrapeWork) []*ScrapeWork { return cfg.getYandexCloudSDScrapeWork(swsPrev) })
 	scs.add("static_configs", 0, func(cfg *Config, _ []*ScrapeWork) []*ScrapeWork { return cfg.getStaticScrapeWork() })
 
+	kubeScrapeCfg := make(chan *Config, 1)
+	if *promscrapeKubernetes {
+		go startScrapeKubeMetrics(globalStopChan, cfg, kubeScrapeCfg, pushData)
+	}
+
 	var tickerCh <-chan time.Time
 	if *configCheckInterval > 0 {
 		ticker := time.NewTicker(*configCheckInterval)
@@ -160,6 +167,9 @@ func runScraper(configFile string, pushData func(at *auth.Token, wr *prompbmarsh
 	}
 	for {
 		scs.updateConfig(cfg)
+		if kubeScrapeCfg != nil {
+			kubeScrapeCfg <- cfg
+		}
 	waitForChans:
 		select {
 		case <-sighupCh:
@@ -205,6 +215,66 @@ func runScraper(configFile string, pushData func(at *auth.Token, wr *prompbmarsh
 			scs.stop()
 			logger.Infof("stopped Prometheus scrapers in %.3f seconds", time.Since(startTime).Seconds())
 			return
+		}
+	}
+}
+
+var kubeMetricsRequestPool = sync.Pool{
+	New: func() any {
+		return &prompbmarshal.WriteRequest{}
+	},
+}
+
+func startScrapeKubeMetrics(stopCh chan struct{}, cfg *Config, cfgCh chan *Config, push func(at *auth.Token, wr *prompbmarshal.WriteRequest)) {
+	labelInstance, err := os.Hostname()
+	if err != nil {
+		logger.Errorf("cannot get hostname: %s", err)
+		labelInstance = "unknown"
+	}
+
+	nodeExporter, err := nodeexporter.New(labelInstance)
+	if err != nil {
+		logger.Errorf("cannot create node exporter: %s", err)
+	}
+
+	scrapeInterval := cfg.Global.ScrapeInterval.Duration()
+	if scrapeInterval <= 0 {
+		scrapeInterval = defaultScrapeInterval
+	}
+
+	ticker := time.NewTicker(scrapeInterval)
+	for {
+		select {
+		case <-stopCh:
+			ticker.Stop()
+			return
+		case newCfg := <-cfgCh:
+			cfg = newCfg
+			newScrapeInterval := cfg.Global.ScrapeInterval.Duration()
+			if scrapeInterval == newScrapeInterval {
+				continue
+			}
+			scrapeInterval = newScrapeInterval
+			if scrapeInterval <= 0 {
+				scrapeInterval = defaultScrapeInterval
+			}
+			ticker.Stop()
+			ticker = time.NewTicker(scrapeInterval)
+		case <-ticker.C:
+			kubeScrapeInterval := cfg.Global.ScrapeInterval.Duration()
+			if kubeScrapeInterval <= 0 {
+				kubeScrapeInterval = defaultScrapeInterval
+			}
+
+			r := kubeMetricsRequestPool.Get().(*prompbmarshal.WriteRequest)
+			r.Reset()
+
+			if nodeExporter != nil {
+				r.Timeseries = nodeExporter.AppendMetrics(r.Timeseries)
+			}
+
+			push(nil, r)
+			kubeMetricsRequestPool.Put(r)
 		}
 	}
 }

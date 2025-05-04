@@ -5,7 +5,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -14,7 +13,9 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/procutil"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promauth"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/autodiscovery"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/azure"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/consul"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/consulagent"
@@ -49,7 +50,7 @@ var (
 	promscrapeConfigFile = flag.String("promscrape.config", "", "Optional path to Prometheus config file with 'scrape_configs' section containing targets to scrape. "+
 		"The path can point to local file and to http url. "+
 		"See https://docs.victoriametrics.com/victoriametrics/single-server-victoriametrics/#how-to-scrape-prometheus-exporters-such-as-node-exporter for details")
-	promscrapeKubernetes = flag.Bool("promscrape.kubernetes", false, "Enable scrape of common Kubernetes metrics")
+	promscrapeKubernetes = flag.Bool("promscrape.kubernetes", false, "Enable automatic discovery and collection of kubernetes cluster metrics")
 
 	fileSDCheckInterval = flag.Duration("promscrape.fileSDCheckInterval", time.Minute, "Interval for checking for changes in 'file_sd_config'. "+
 		"See https://docs.victoriametrics.com/victoriametrics/sd_configs/#file_sd_configs for details")
@@ -156,7 +157,34 @@ func runScraper(configFile string, pushData func(at *auth.Token, wr *prompbmarsh
 
 	kubeScrapeCfg := make(chan *Config, 1)
 	if *promscrapeKubernetes {
-		go startScrapeKubeMetrics(globalStopChan, cfg, kubeScrapeCfg, pushData)
+		ad := autodiscovery.MustStart()
+		scs.add("vmagent_autodiscovery", time.Second*10, func(cfg *Config, swsPrev []*ScrapeWork) []*ScrapeWork {
+			targets := ad.Targets()
+			works := make([]*ScrapeWork, 0, len(targets))
+			scrapeInterval := cfg.Global.ScrapeInterval.Duration()
+			if scrapeInterval <= 0 {
+				scrapeInterval = defaultScrapeInterval
+			}
+			scrapeTimeout := cfg.Global.ScrapeTimeout.Duration()
+			if scrapeTimeout <= 0 {
+				scrapeTimeout = defaultScrapeTimeout
+			}
+			for _, t := range targets {
+				works = append(works, &ScrapeWork{
+					ScrapeURL:       t.URL,
+					ScrapeInterval:  scrapeInterval,
+					ScrapeTimeout:   scrapeTimeout,
+					Labels:          t.Labels,
+					AuthConfig:      &promauth.Config{},
+					ProxyAuthConfig: &promauth.Config{},
+					MaxScrapeSize:   (*maxScrapeSize).N,
+				})
+			}
+			return works
+		})
+
+		nodeName := ad.NodeName()
+		go startScrapeNodeMetrics(nodeName, globalStopChan, cfg, kubeScrapeCfg, pushData)
 	}
 
 	var tickerCh <-chan time.Time
@@ -225,14 +253,9 @@ var kubeMetricsRequestPool = sync.Pool{
 	},
 }
 
-func startScrapeKubeMetrics(stopCh chan struct{}, cfg *Config, cfgCh chan *Config, push func(at *auth.Token, wr *prompbmarshal.WriteRequest)) {
-	labelInstance, err := os.Hostname()
-	if err != nil {
-		logger.Errorf("cannot get hostname: %s", err)
-		labelInstance = "unknown"
-	}
+func startScrapeNodeMetrics(nodename string, stopCh chan struct{}, cfg *Config, cfgCh chan *Config, push func(at *auth.Token, wr *prompbmarshal.WriteRequest)) {
 
-	nodeExporter, err := nodeexporter.New(labelInstance)
+	nodeExporter, err := nodeexporter.New(nodename)
 	if err != nil {
 		logger.Errorf("cannot create node exporter: %s", err)
 	}
@@ -261,11 +284,6 @@ func startScrapeKubeMetrics(stopCh chan struct{}, cfg *Config, cfgCh chan *Confi
 			ticker.Stop()
 			ticker = time.NewTicker(scrapeInterval)
 		case <-ticker.C:
-			kubeScrapeInterval := cfg.Global.ScrapeInterval.Duration()
-			if kubeScrapeInterval <= 0 {
-				kubeScrapeInterval = defaultScrapeInterval
-			}
-
 			r := kubeMetricsRequestPool.Get().(*prompbmarshal.WriteRequest)
 			r.Reset()
 

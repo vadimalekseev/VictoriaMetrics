@@ -32,7 +32,7 @@ func (n *NodeExporter) AppendMetrics(ts []prompbmarshal.TimeSeries) []prompbmars
 	return ts
 }
 
-const jobName = "vmagent_node_exporter"
+const jobName = "vmscrape_node_exporter"
 
 func (n *NodeExporter) appendMetric(ts []prompbmarshal.TimeSeries, name string, value float64, timestamp int64, additionalLabels ...prompbmarshal.Label) []prompbmarshal.TimeSeries {
 	labels := []prompbmarshal.Label{

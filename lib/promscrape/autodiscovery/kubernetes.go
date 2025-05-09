@@ -158,7 +158,19 @@ type podMetadata struct {
 }
 
 type podSpec struct {
-	NodeName string `json:"nodeName"`
+	NodeName   string         `json:"nodeName"`
+	Containers []podContainer `json:"containers"`
+}
+
+type podContainer struct {
+	Name  string          `json:"name"`
+	Image string          `json:"image"`
+	Ports []containerPort `json:"ports"`
+}
+
+type containerPort struct {
+	Name          string `json:"name"`
+	ContainerPort int    `json:"containerPort"`
 }
 
 type podStatus struct {

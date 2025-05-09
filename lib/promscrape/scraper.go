@@ -174,7 +174,7 @@ func runScraper(configFile string, pushData func(at *auth.Token, wr *prompbmarsh
 					ScrapeURL:       t.URL,
 					ScrapeInterval:  scrapeInterval,
 					ScrapeTimeout:   scrapeTimeout,
-					Labels:          t.Labels,
+					Labels:          &promutil.Labels{Labels: t.Labels},
 					AuthConfig:      &promauth.Config{},
 					ProxyAuthConfig: &promauth.Config{},
 					MaxScrapeSize:   (*maxScrapeSize).N,
@@ -254,7 +254,6 @@ var kubeMetricsRequestPool = sync.Pool{
 }
 
 func startScrapeNodeMetrics(nodename string, stopCh chan struct{}, cfg *Config, cfgCh chan *Config, push func(at *auth.Token, wr *prompbmarshal.WriteRequest)) {
-
 	nodeExporter, err := nodeexporter.New(nodename)
 	if err != nil {
 		logger.Errorf("cannot create node exporter: %s", err)
@@ -286,11 +285,9 @@ func startScrapeNodeMetrics(nodename string, stopCh chan struct{}, cfg *Config, 
 		case <-ticker.C:
 			r := kubeMetricsRequestPool.Get().(*prompbmarshal.WriteRequest)
 			r.Reset()
-
 			if nodeExporter != nil {
 				r.Timeseries = nodeExporter.AppendMetrics(r.Timeseries)
 			}
-
 			push(nil, r)
 			kubeMetricsRequestPool.Put(r)
 		}

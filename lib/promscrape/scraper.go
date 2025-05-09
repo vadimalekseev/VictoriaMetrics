@@ -158,7 +158,7 @@ func runScraper(configFile string, pushData func(at *auth.Token, wr *prompbmarsh
 	kubeScrapeCfg := make(chan *Config, 1)
 	if *promscrapeKubernetes {
 		ad := autodiscovery.MustStart()
-		scs.add("vmagent_autodiscovery", time.Second*10, func(cfg *Config, swsPrev []*ScrapeWork) []*ScrapeWork {
+		scs.add("kubernetes_sd_auto", time.Second*10, func(cfg *Config, swsPrev []*ScrapeWork) []*ScrapeWork {
 			targets := ad.Targets()
 			works := make([]*ScrapeWork, 0, len(targets))
 			scrapeInterval := cfg.Global.ScrapeInterval.Duration()
@@ -174,10 +174,11 @@ func runScraper(configFile string, pushData func(at *auth.Token, wr *prompbmarsh
 					ScrapeURL:       t.URL,
 					ScrapeInterval:  scrapeInterval,
 					ScrapeTimeout:   scrapeTimeout,
-					Labels:          t.Labels,
-					AuthConfig:      &promauth.Config{},
-					ProxyAuthConfig: &promauth.Config{},
 					MaxScrapeSize:   (*maxScrapeSize).N,
+					Labels:          &promutil.Labels{Labels: t.Labels},
+					ProxyAuthConfig: &promauth.Config{},
+					AuthConfig:      &promauth.Config{},
+					jobNameOriginal: "kubernetes_sd_auto",
 				})
 			}
 			return works
@@ -254,7 +255,6 @@ var kubeMetricsRequestPool = sync.Pool{
 }
 
 func startScrapeNodeMetrics(nodename string, stopCh chan struct{}, cfg *Config, cfgCh chan *Config, push func(at *auth.Token, wr *prompbmarshal.WriteRequest)) {
-
 	nodeExporter, err := nodeexporter.New(nodename)
 	if err != nil {
 		logger.Errorf("cannot create node exporter: %s", err)
@@ -286,11 +286,9 @@ func startScrapeNodeMetrics(nodename string, stopCh chan struct{}, cfg *Config, 
 		case <-ticker.C:
 			r := kubeMetricsRequestPool.Get().(*prompbmarshal.WriteRequest)
 			r.Reset()
-
 			if nodeExporter != nil {
 				r.Timeseries = nodeExporter.AppendMetrics(r.Timeseries)
 			}
-
 			push(nil, r)
 			kubeMetricsRequestPool.Put(r)
 		}

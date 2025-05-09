@@ -11,11 +11,12 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promutil"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/timeutil"
 	"gopkg.in/yaml.v2"
 )
@@ -55,7 +56,7 @@ func MustStart() *Discovery {
 
 type ScrapeTarget struct {
 	URL    string
-	Labels *promutil.Labels
+	Labels []prompbmarshal.Label
 }
 
 func (d *Discovery) Targets() []ScrapeTarget {
@@ -76,12 +77,18 @@ func (d *Discovery) mustStartWatchCluster() {
 
 		handleEvent := func(event watchEvent) {
 			// Reset retry duration after successful response
-			retryDuration = timeutil.AddJitterToDuration(minRetryDuration)
+			if retryDuration > minRetryDuration*2 {
+				retryDuration = timeutil.AddJitterToDuration(minRetryDuration)
+			}
 			d.handleEvent(event)
 		}
 
 		if err := d.kubeAPI.WatchNodePods(d.currentNodeName, handleEvent); err != nil {
 			logger.Errorf("cannot watch Kubernetes pods: %s", err)
+			d.mu.Lock()
+			clear(d.targets)
+			d.mu.Unlock()
+
 			time.Sleep(retryDuration)
 			retryDuration = retryDuration * 2
 			if retryDuration > maxRetryDuration {
@@ -92,8 +99,9 @@ func (d *Discovery) mustStartWatchCluster() {
 }
 
 type targetEntry struct {
-	Pod       string
 	Namespace string
+	Pod       string
+	Port      int
 }
 
 func (d *Discovery) handleEvent(event watchEvent) {
@@ -109,46 +117,77 @@ func (d *Discovery) handleEvent(event watchEvent) {
 			// PodIP can be empty in case of pending pods
 			return
 		}
-		port := pod.Metadata.Labels["vmscrape/port"]
-		metricsPath := pod.Metadata.Labels["vmscrape/metrics_path"]
-		if metricsPath == "" {
-			metricsPath = "/metrics"
-		}
-		metricsPath = path.Join("/", metricsPath)
 
-		scrapeURL := "http://" + net.JoinHostPort(pod.Status.PodIP, port) + metricsPath
+		targetPortName := pod.Metadata.Labels["vmscrape/port"]
+		targetContainer := pod.Metadata.Labels["vmscrape/container"]
+		targetMetricsPath := pod.Metadata.Labels["vmscrape/metrics_path"]
 
-		labels := promutil.NewLabelsFromMap(pod.Metadata.Labels)
-		labels.Add("instance", pod.Metadata.Name)
-		labels.Add("job", "vmscrape")
+		if targetMetricsPath == "" {
+			targetMetricsPath = "/metrics"
+		}
+		targetMetricsPath = path.Join("/", targetMetricsPath)
 
-		entry := targetEntry{
-			Pod:       pod.Metadata.Name,
-			Namespace: pod.Metadata.Namespace,
-		}
-		d.mu.Lock()
-		d.targets[entry] = ScrapeTarget{
-			URL:    scrapeURL,
-			Labels: labels,
-		}
-		d.mu.Unlock()
+		jobName := d.currentNamespace + "/" + "vmscrape"
+		visitTargetContainers(pod.Spec.Containers, targetContainer, targetPortName, func(c podContainer, cp containerPort) {
+			ipPort := net.JoinHostPort(pod.Status.PodIP, strconv.Itoa(cp.ContainerPort))
+			labels := []prompbmarshal.Label{
+				{Name: "job", Value: jobName},
+				{Name: "instance", Value: ipPort},
+				{Name: "namespace", Value: pod.Metadata.Namespace},
+				{Name: "container", Value: c.Name},
+				{Name: "pod", Value: pod.Metadata.Name},
+				{Name: "endpoint", Value: cp.Name},
+			}
+			scrapeURL := "http://" + ipPort + targetMetricsPath
+			entry := targetEntry{
+				Pod:       pod.Metadata.Name,
+				Namespace: pod.Metadata.Namespace,
+				Port:      cp.ContainerPort,
+			}
+			d.mu.Lock()
+			d.targets[entry] = ScrapeTarget{
+				URL:    scrapeURL,
+				Labels: labels,
+			}
+			d.mu.Unlock()
+		})
 	case "DELETED":
 		var pod pod
 		if err := json.Unmarshal(event.Object, &pod); err != nil {
 			logger.Errorf("cannon unmarshal object %q of event %q: %s", event.Object, event.Type, err)
 			return
 		}
-		entry := targetEntry{
-			Pod:       pod.Metadata.Name,
-			Namespace: pod.Metadata.Namespace,
-		}
-		d.mu.Lock()
-		delete(d.targets, entry)
-		d.mu.Unlock()
+		targetPortName := pod.Metadata.Labels["vmscrape/port"]
+		targetContainer := pod.Metadata.Labels["vmscrape/container"]
+		visitTargetContainers(pod.Spec.Containers, targetContainer, targetPortName, func(_ podContainer, cp containerPort) {
+			entry := targetEntry{
+				Pod:       pod.Metadata.Name,
+				Namespace: pod.Metadata.Namespace,
+				Port:      cp.ContainerPort,
+			}
+			d.mu.Lock()
+			delete(d.targets, entry)
+			d.mu.Unlock()
+		})
 	case "ERROR":
 		logger.Errorf("got an error event from Kubernetes API: %q", string(event.Object))
 	default:
 		logger.Warnf("unexpected Kubernetes event type %q: %s", event.Type, string(event.Object))
+	}
+}
+
+func visitTargetContainers(containers []podContainer, targetContainer, targetPortName string, f func(podContainer, containerPort)) {
+	for _, c := range containers {
+		if targetContainer != "" && c.Name != targetContainer {
+			// Skip unneeded containers by its name if "vmscrape/container" label is set
+			continue
+		}
+		for _, cp := range c.Ports {
+			if cp.Name == targetPortName {
+				f(c, cp)
+				break
+			}
+		}
 	}
 }
 

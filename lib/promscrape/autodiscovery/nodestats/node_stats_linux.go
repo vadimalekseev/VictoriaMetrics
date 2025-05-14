@@ -1,6 +1,6 @@
 //go:build linux
 
-package nodeexporter
+package nodestats
 
 import (
 	"flag"

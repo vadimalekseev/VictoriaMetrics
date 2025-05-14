@@ -155,6 +155,7 @@ type podMetadata struct {
 	Name      string
 	Labels    map[string]string `json:"labels"`
 	Namespace string            `json:"namespace"`
+	UID       string            `json:"uid"`
 }
 
 type podSpec struct {
@@ -174,7 +175,14 @@ type containerPort struct {
 }
 
 type podStatus struct {
-	PodIP string `json:"podIP"`
+	PodIP             string            `json:"podIP"`
+	ContainerStatuses []containerStatus `json:"containerStatuses"`
+	QosClass          string            `json:"qosClass"`
+}
+
+type containerStatus struct {
+	Name        string `json:"name"`
+	ContainerID string `json:"containerID"`
 }
 
 func (c *kubeAPIClient) GetPod(ctx context.Context, namespace string, podName string) (pod, error) {

@@ -1,4 +1,4 @@
-package containermetrics
+package containerstats
 
 import (
 	"context"
@@ -18,7 +18,7 @@ type containerdClient struct {
 	client *http.Client
 }
 
-func newContainerdClient() (*containerdClient, error) {
+func newContainerdClient() *containerdClient {
 	var protocols http.Protocols
 	protocols.SetUnencryptedHTTP2(true)
 	client := &http.Client{
@@ -32,7 +32,7 @@ func newContainerdClient() (*containerdClient, error) {
 	}
 	return &containerdClient{
 		client: client,
-	}, nil
+	}
 }
 
 type getTaskRequest struct {

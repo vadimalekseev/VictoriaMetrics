@@ -128,7 +128,7 @@ func (d *Discovery) handleEvent(event watchEvent) {
 		targetMetricsPath = path.Join("/", targetMetricsPath)
 
 		jobName := d.currentNamespace + "/" + "vmscrape"
-		visitTargetContainers(pod.Spec.Containers, targetContainer, targetPortName, func(c podContainer, cp containerPort) {
+		visitTargetContainers(pod, targetContainer, targetPortName, func(c podContainer, cs containerStatus, cp containerPort) {
 			ipPort := net.JoinHostPort(pod.Status.PodIP, strconv.Itoa(cp.ContainerPort))
 			labels := []prompbmarshal.Label{
 				{Name: "job", Value: jobName},
@@ -144,6 +144,7 @@ func (d *Discovery) handleEvent(event watchEvent) {
 				Namespace: pod.Metadata.Namespace,
 				Port:      cp.ContainerPort,
 			}
+
 			d.mu.Lock()
 			d.targets[entry] = ScrapeTarget{
 				URL:    scrapeURL,
@@ -159,7 +160,7 @@ func (d *Discovery) handleEvent(event watchEvent) {
 		}
 		targetPortName := pod.Metadata.Labels["vmscrape/port"]
 		targetContainer := pod.Metadata.Labels["vmscrape/container"]
-		visitTargetContainers(pod.Spec.Containers, targetContainer, targetPortName, func(_ podContainer, cp containerPort) {
+		visitTargetContainers(pod, targetContainer, targetPortName, func(_ podContainer, _ containerStatus, cp containerPort) {
 			entry := targetEntry{
 				Pod:       pod.Metadata.Name,
 				Namespace: pod.Metadata.Namespace,
@@ -176,15 +177,30 @@ func (d *Discovery) handleEvent(event watchEvent) {
 	}
 }
 
-func visitTargetContainers(containers []podContainer, targetContainer, targetPortName string, f func(podContainer, containerPort)) {
-	for _, c := range containers {
+func visitTargetContainers(p pod, targetContainer, targetPortName string, f func(podContainer, containerStatus, containerPort)) {
+	for _, c := range p.Spec.Containers {
 		if targetContainer != "" && c.Name != targetContainer {
 			// Skip unneeded containers by its name if "vmscrape/container" label is set
 			continue
 		}
+
+		var cs containerStatus
+		var ok bool
+		for _, cs = range p.Status.ContainerStatuses {
+			if cs.Name == c.Name {
+				ok = true
+				break
+			}
+		}
+		if !ok {
+			// Each container in the pod must have its own status.
+			logger.Errorf("cannot find container %q status in pod %q", c.Name, p.Metadata.Name)
+			continue
+		}
+
 		for _, cp := range c.Ports {
 			if cp.Name == targetPortName {
-				f(c, cp)
+				f(c, cs, cp)
 				break
 			}
 		}
@@ -220,7 +236,7 @@ func loadInClusterConfig() (*kubeAPIConfig, error) {
 		GetCACert: func() (*x509.CertPool, error) {
 			certs, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/ca.crt")
 			if err != nil {
-				return nil, fmt.Errorf("cannot read root CA from %q: %s", err)
+				return nil, fmt.Errorf("cannot read root CA: %s", err)
 			}
 
 			roots := x509.NewCertPool()
@@ -237,6 +253,7 @@ type kubeConfig struct {
 		Name    string `yaml:"name"`
 		Cluster struct {
 			Server                   string `yaml:"server"`
+			CertificateAuthority     string `yaml:"certificate-authority"`
 			CertificateAuthorityData string `yaml:"certificate-authority-data"`
 		} `yaml:"cluster"`
 	} `yaml:"clusters"`
@@ -245,7 +262,9 @@ type kubeConfig struct {
 		Name string `yaml:"name"`
 		User struct {
 			Token                 string `yaml:"token"`
+			ClientCertificate     string `yaml:"client-certificate"`
 			ClientCertificateData string `yaml:"client-certificate-data"`
+			ClientKey             string `yaml:"client-key"`
 			ClientKeyData         string `yaml:"client-key-data"`
 		} `yaml:"user"`
 	} `yaml:"users"`
@@ -283,13 +302,27 @@ func loadLocalConfig() (*kubeAPIConfig, error) {
 			break
 		}
 	}
-	var server, ca string
+
+	var server string
+	var ca []byte
 	for _, cl := range config.Clusters {
-		if cl.Name == cluster {
-			server = cl.Cluster.Server
-			ca = cl.Cluster.CertificateAuthorityData
-			break
+		if cl.Name != cluster {
+			continue
 		}
+		server = cl.Cluster.Server
+		if cl.Cluster.CertificateAuthority != "" {
+			ca, err = os.ReadFile(cl.Cluster.CertificateAuthority)
+			if err != nil {
+				return nil, fmt.Errorf("cannot read cluster certificate authority: %s", err)
+			}
+		}
+		if cl.Cluster.CertificateAuthorityData != "" {
+			ca, err = base64.StdEncoding.AppendDecode(nil, []byte(cl.Cluster.CertificateAuthorityData))
+			if err != nil {
+				return nil, fmt.Errorf("cannot decode base64 encoded CA certificate data: %s", err)
+			}
+		}
+		break
 	}
 
 	var token string
@@ -302,11 +335,28 @@ func loadLocalConfig() (*kubeAPIConfig, error) {
 		token = u.User.Token
 
 		if u.User.ClientCertificateData != "" {
-			clientCert, _ = base64.StdEncoding.AppendDecode(nil, []byte(u.User.ClientCertificateData))
+			clientCert, err = base64.StdEncoding.AppendDecode(nil, []byte(u.User.ClientCertificateData))
+			if err != nil {
+				return nil, fmt.Errorf("cannot decode base64 encoded client certificate data: %s", err)
+			}
+		} else if u.User.ClientCertificate != "" {
+			clientCert, err = os.ReadFile(u.User.ClientCertificate)
+			if err != nil {
+				return nil, fmt.Errorf("cannot read client certificate from %q: %s", u.User.ClientCertificate, err)
+			}
 		}
 		if u.User.ClientKeyData != "" {
-			clientCertKey, _ = base64.StdEncoding.AppendDecode(nil, []byte(u.User.ClientKeyData))
+			clientCertKey, err = base64.StdEncoding.AppendDecode(nil, []byte(u.User.ClientKeyData))
+			if err != nil {
+				return nil, fmt.Errorf("cannot decode base64 encoded client certificate key data: %s", err)
+			}
+		} else if u.User.ClientKey != "" {
+			clientCertKey, err = os.ReadFile(u.User.ClientKey)
+			if err != nil {
+				return nil, fmt.Errorf("cannot read client key from %q: %s", u.User.ClientCertificate, err)
+			}
 		}
+		break
 	}
 
 	return &kubeAPIConfig{
@@ -315,12 +365,11 @@ func loadLocalConfig() (*kubeAPIConfig, error) {
 		ClientCert:    clientCert,
 		ClientCertKey: clientCertKey,
 		GetCACert: func() (*x509.CertPool, error) {
-			pemCerts, err := base64.StdEncoding.AppendDecode(nil, []byte(ca))
-			if err != nil {
-				return nil, err
+			if len(ca) == 0 {
+				return nil, nil
 			}
 			roots := x509.NewCertPool()
-			if !roots.AppendCertsFromPEM(pemCerts) {
+			if !roots.AppendCertsFromPEM(ca) {
 				return nil, fmt.Errorf("cannot parse root CA for %q cluster from %q for user %q; no certs fetched", cluster, configPath, user)
 			}
 			return roots, nil

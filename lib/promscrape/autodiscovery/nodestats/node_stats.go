@@ -1,4 +1,4 @@
-package nodeexporter
+package nodestats
 
 import (
 	"regexp"
@@ -9,18 +9,19 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"
 )
 
-type NodeExporter struct {
+// NodeStats exports current node metrics in node_exporter format.
+type NodeStats struct {
 	labelInstance string
 }
 
-func New(labelInstance string) (*NodeExporter, error) {
+func New(labelInstance string) (*NodeStats, error) {
 	mustInitProcFS()
-	return &NodeExporter{
+	return &NodeStats{
 		labelInstance: labelInstance,
 	}, nil
 }
 
-func (n *NodeExporter) AppendMetrics(ts []prompbmarshal.TimeSeries) []prompbmarshal.TimeSeries {
+func (n *NodeStats) Append(ts []prompbmarshal.TimeSeries) []prompbmarshal.TimeSeries {
 	timestamp := time.Now().UnixMilli()
 
 	ts = n.appendUname(ts, timestamp)
@@ -34,7 +35,7 @@ func (n *NodeExporter) AppendMetrics(ts []prompbmarshal.TimeSeries) []prompbmars
 
 const jobName = "vmscrape_node_exporter"
 
-func (n *NodeExporter) appendMetric(ts []prompbmarshal.TimeSeries, name string, value float64, timestamp int64, additionalLabels ...prompbmarshal.Label) []prompbmarshal.TimeSeries {
+func (n *NodeStats) appendMetric(ts []prompbmarshal.TimeSeries, name string, value float64, timestamp int64, additionalLabels ...prompbmarshal.Label) []prompbmarshal.TimeSeries {
 	labels := []prompbmarshal.Label{
 		{Name: "__name__", Value: name},
 		{Name: "instance", Value: n.labelInstance},
@@ -57,7 +58,7 @@ type unixName struct {
 	DomainName string
 }
 
-func (n *NodeExporter) appendUname(ts []prompbmarshal.TimeSeries, timestamp int64) []prompbmarshal.TimeSeries {
+func (n *NodeStats) appendUname(ts []prompbmarshal.TimeSeries, timestamp int64) []prompbmarshal.TimeSeries {
 	uname, err := parseUname()
 	if err != nil {
 		logger.Errorf("cannot get uname: %s", err)
@@ -74,7 +75,7 @@ func (n *NodeExporter) appendUname(ts []prompbmarshal.TimeSeries, timestamp int6
 	return ts
 }
 
-func (n *NodeExporter) appendMemoryMetrics(ts []prompbmarshal.TimeSeries, timestamp int64) []prompbmarshal.TimeSeries {
+func (n *NodeStats) appendMemoryMetrics(ts []prompbmarshal.TimeSeries, timestamp int64) []prompbmarshal.TimeSeries {
 	stats, err := parseMemoryStats()
 	if err != nil {
 		logger.Errorf("cannot get memory info from: %s", err)
@@ -95,7 +96,7 @@ func (n *NodeExporter) appendMemoryMetrics(ts []prompbmarshal.TimeSeries, timest
 	return ts
 }
 
-func (n *NodeExporter) appendCPUMetrics(ts []prompbmarshal.TimeSeries, timestamp int64) []prompbmarshal.TimeSeries {
+func (n *NodeStats) appendCPUMetrics(ts []prompbmarshal.TimeSeries, timestamp int64) []prompbmarshal.TimeSeries {
 	stats, err := parseCPUStats()
 	if err != nil {
 		logger.Errorf("cannot get cpu stats: %s", err)
@@ -121,7 +122,7 @@ func (n *NodeExporter) appendCPUMetrics(ts []prompbmarshal.TimeSeries, timestamp
 	return ts
 }
 
-func (n *NodeExporter) appendNetworkMetrics(ts []prompbmarshal.TimeSeries, timestamp int64) []prompbmarshal.TimeSeries {
+func (n *NodeStats) appendNetworkMetrics(ts []prompbmarshal.TimeSeries, timestamp int64) []prompbmarshal.TimeSeries {
 	stats, err := parseNetDev()
 	if err != nil {
 		logger.Errorf("cannot get net info: %s", err)
@@ -142,7 +143,7 @@ func (n *NodeExporter) appendNetworkMetrics(ts []prompbmarshal.TimeSeries, times
 // TODO: Replace with a more readable and maintainable version.
 var diskDeviceFilter = regexp.MustCompile("^(z?ram|loop|fd|(h|s|v|xv)d[a-z]|nvme\\d+n\\d+p)\\d+$")
 
-func (n *NodeExporter) appendDiskMetrics(ts []prompbmarshal.TimeSeries, timestamp int64) []prompbmarshal.TimeSeries {
+func (n *NodeStats) appendDiskMetrics(ts []prompbmarshal.TimeSeries, timestamp int64) []prompbmarshal.TimeSeries {
 	diskStats, err := parseDiskStats()
 	if err != nil {
 		logger.Errorf("cannot get disk stats: %s", err)

@@ -16,6 +16,8 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promauth"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/autodiscovery"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/autodiscovery/containerstats"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/autodiscovery/nodestats"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/azure"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/consul"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/consulagent"
@@ -37,7 +39,6 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/puppetdb"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/vultr"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/yandexcloud"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/nodeexporter"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promutil"
 	"github.com/VictoriaMetrics/metrics"
 )
@@ -185,7 +186,7 @@ func runScraper(configFile string, pushData func(at *auth.Token, wr *prompbmarsh
 		})
 
 		nodeName := ad.NodeName()
-		go startScrapeNodeMetrics(nodeName, globalStopChan, cfg, kubeScrapeCfg, pushData)
+		go startScrapeSelf(nodeName, globalStopChan, cfg, kubeScrapeCfg, pushData)
 	}
 
 	var tickerCh <-chan time.Time
@@ -254,11 +255,12 @@ var kubeMetricsRequestPool = sync.Pool{
 	},
 }
 
-func startScrapeNodeMetrics(nodename string, stopCh chan struct{}, cfg *Config, cfgCh chan *Config, push func(at *auth.Token, wr *prompbmarshal.WriteRequest)) {
-	nodeExporter, err := nodeexporter.New(nodename)
+func startScrapeSelf(nodename string, stopCh chan struct{}, cfg *Config, cfgCh chan *Config, push func(at *auth.Token, wr *prompbmarshal.WriteRequest)) {
+	nodeStats, err := nodestats.New(nodename)
 	if err != nil {
-		logger.Errorf("cannot create node exporter: %s", err)
+		logger.Fatalf("cannot create node exporter: %s", err)
 	}
+	containersStats := containerstats.StartWatch()
 
 	scrapeInterval := cfg.Global.ScrapeInterval.Duration()
 	if scrapeInterval <= 0 {
@@ -286,9 +288,8 @@ func startScrapeNodeMetrics(nodename string, stopCh chan struct{}, cfg *Config, 
 		case <-ticker.C:
 			r := kubeMetricsRequestPool.Get().(*prompbmarshal.WriteRequest)
 			r.Reset()
-			if nodeExporter != nil {
-				r.Timeseries = nodeExporter.AppendMetrics(r.Timeseries)
-			}
+			r.Timeseries = nodeStats.Append(r.Timeseries)
+			r.Timeseries = containersStats.Append(r.Timeseries)
 			push(nil, r)
 			kubeMetricsRequestPool.Put(r)
 		}
